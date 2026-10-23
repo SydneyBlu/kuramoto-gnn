@@ -1,1 +1,5 @@
-__all__ = classes = []
+from .kuramoto_conv import KuramotoConv
+
+__all__ = classes = [
+    'KuramotoConv',
+]
