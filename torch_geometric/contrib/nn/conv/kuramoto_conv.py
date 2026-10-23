@@ -331,15 +331,17 @@ class KuramotoConv(MessagePassing):
         return self._integrate(vector_field, x, adjoint_params)
 
     def _coupling(self, x: Tensor, adj: Adj, edge_weight: OptTensor) -> Tensor:
-        # propagate_type: (x: Tensor, edge_weight: OptTensor)
-        out = self.propagate(adj, x=x, edge_weight=edge_weight)
-
         if self.mean_field:
+            h = torch.cat([x.sin(), x.cos(), x], dim=-1)
+            # propagate_type: (x: OptTensor, h: OptTensor,
+            #                  edge_weight: OptTensor)
+            out = self.propagate(adj, x=None, h=h, edge_weight=edge_weight)
             sin_aggr, cos_aggr, x_aggr = out.split(x.size(-1), dim=-1)
             r = (sin_aggr.square() + cos_aggr.square()).clamp_min(1e-12).sqrt()
             return r * torch.sin(x_aggr - x)
 
-        return out
+        # propagate_type: (x: OptTensor, h: OptTensor, edge_weight: OptTensor)
+        return self.propagate(adj, x=x, h=None, edge_weight=edge_weight)
 
     def _integrate(
         self,
@@ -393,20 +395,22 @@ class KuramotoConv(MessagePassing):
 
         return alpha.mean(dim=-1)
 
-    def message(self, x_i: Tensor, x_j: Tensor,
+    def message(self, x_i: OptTensor, x_j: OptTensor, h_j: OptTensor,
                 edge_weight: OptTensor) -> Tensor:
-        if self.mean_field:
-            out = torch.cat([x_j.sin(), x_j.cos(), x_j], dim=-1)
+        if h_j is not None:  # Mean-field, `h = [sin(X) || cos(X) || X]`.
+            out = h_j
         else:
+            assert x_i is not None and x_j is not None
             out = torch.sin(x_j - x_i)
         return out if edge_weight is None else edge_weight.view(-1, 1) * out
 
-    def message_and_aggregate(self, adj_t: Adj, x: Tensor) -> Tensor:
+    def message_and_aggregate(self, adj_t: Adj, x: OptTensor,
+                              h: OptTensor) -> Tensor:
+        if h is not None:  # Mean-field, `h = [sin(X) || cos(X) || X]`.
+            return spmm(adj_t, h)
+
+        assert x is not None
         sin_x, cos_x = x.sin(), x.cos()
-
-        if self.mean_field:
-            return spmm(adj_t, torch.cat([sin_x, cos_x, x], dim=-1))
-
         out = spmm(adj_t, torch.cat([sin_x, cos_x], dim=-1))
         sin_aggr, cos_aggr = out.split(x.size(-1), dim=-1)
         return sin_aggr * cos_x - cos_aggr * sin_x
