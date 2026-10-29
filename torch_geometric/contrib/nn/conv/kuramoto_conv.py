@@ -105,7 +105,9 @@ class KuramotoConv(MessagePassing):
 
     which uses the averaged phase :math:`\boldsymbol{\phi}_i` in place of the
     argument of :math:`\sum_j a_{i,j} e^{\iota \mathbf{x}_j}`, and is thus
-    not identical to the equation above.
+    not identical to the equation above. Unlike the equation above, it is not
+    differentiable where :math:`\sum_j a_{i,j} e^{\iota \mathbf{x}_j}`
+    vanishes.
 
     .. note::
 

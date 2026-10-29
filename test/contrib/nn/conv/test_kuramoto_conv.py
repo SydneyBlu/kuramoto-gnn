@@ -240,8 +240,10 @@ def test_kuramoto_conv_torchdiffeq_fixed_step(method):
 @withPackage('torchdiffeq')
 @pytest.mark.parametrize('mean_field', [False, True])
 def test_kuramoto_conv_torchdiffeq_adaptive(mean_field):
-    x, edge_index = get_graph()
-    x = x.double().requires_grad_()
+    _, edge_index = get_graph()
+    # Phases within one radian keep the mean-field `r_i` away from zero, where
+    # it is not differentiable and solvers converge slowly:
+    x = torch.rand(6, 8, dtype=torch.double, requires_grad=True)
     conv1 = KuramotoConv(8, time=2.0, method='rk4', step_size=0.01, heads=2,
                          mean_field=mean_field)
     conv2 = KuramotoConv(8, time=2.0, method='dopri5', heads=2,
