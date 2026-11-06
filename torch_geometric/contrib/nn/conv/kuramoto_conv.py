@@ -165,7 +165,10 @@ class KuramotoConv(MessagePassing):
         normalize_over (str, optional): Whether attention coefficients sum to
             one over the incoming edges of each target node
             (:obj:`"target"`) or over the outgoing edges of each source node
-            (:obj:`"source"`). (default: :obj:`"target"`)
+            (:obj:`"source"`). With :obj:`"source"`, the coefficients of a
+            target node may sum to much more than one, which makes the
+            dynamics stiff around high-degree nodes, such that fixed-step
+            solvers may require small step sizes. (default: :obj:`"target"`)
         mean_field (bool, optional): If set to :obj:`True`, will use the
             mean-field formulation of the official implementation.
             (default: :obj:`False`)
