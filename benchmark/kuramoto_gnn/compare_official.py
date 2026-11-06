@@ -118,18 +118,21 @@ def check_numerics(official, model, data, edge_index):
     model.conv.register_propagate_forward_hook(
         lambda *_: nfe.__setitem__(0, nfe[0] + 1))
 
-    official.eval()
-    model.eval()
-    official.resetNFE()
-    out1 = official(data.x)[0]
-    nfe1 = official.getNFE()
-    out2 = model(data.x, edge_index)
-    nfe2 = nfe[0]
-
-    for out, module in [(out1, official), (out2, model)]:
+    def forward_backward(module, forward):
+        # Backpropagate right away, such that only one autograd graph through
+        # the solver is alive at a time:
+        module.eval()
         module.zero_grad()
+        out = forward()
         F.cross_entropy(out[data.train_mask],
                         data.y[data.train_mask]).backward()
+        return out.detach()
+
+    official.resetNFE()
+    out1 = forward_backward(official, lambda: official(data.x)[0])
+    nfe1 = official.getNFE()
+    out2 = forward_backward(model, lambda: model(data.x, edge_index))
+    nfe2 = nfe[0]
 
     print(f'Logits:  max abs diff {(out1 - out2).abs().max():.2e} '
           f'(max abs value {out1.abs().max():.2e})')
