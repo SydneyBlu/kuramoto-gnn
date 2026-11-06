@@ -4,17 +4,18 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 from torch import Tensor
 
+from torch_geometric.index import index2ptr
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.nn.dense.linear import Linear
 from torch_geometric.typing import Adj, OptTensor, SparseTensor
 from torch_geometric.utils import (
     add_remaining_self_loops,
+    index_sort,
     is_torch_sparse_tensor,
     scatter,
     softmax,
     spmm,
     to_edge_index,
-    to_torch_csr_tensor,
 )
 
 # Methods that `torchdiffeq` integrates on a fixed grid of size `step_size`:
@@ -81,8 +82,9 @@ class KuramotoConv(MessagePassing):
     .. math::
         a_{i,j} = \frac{1}{H} \sum_{h=1}^H \textrm{softmax}_j \left(
         \frac{(\mathbf{W}^{(h)}_Q \mathbf{x}_i(0))^{\top}
-        (\mathbf{W}^{(h)}_K \mathbf{x}_j(0))}{\sqrt{d}} \right).
+        (\mathbf{W}^{(h)}_K \mathbf{x}_j(0))}{\sqrt{d}} \right),
 
+    where :math:`d` denotes the number of attention channels per head.
     If :obj:`attention=False`, :math:`a_{i,j}` is instead given by the edge
     weights (or one if no edge weights are given), which recovers the
     classical Kuramoto model on a (weighted) graph.
@@ -92,7 +94,11 @@ class KuramotoConv(MessagePassing):
     :math:`\mathbf{A} [\sin(\mathbf{X}) \, \Vert \, \cos(\mathbf{X})]` via
     :math:`\sin(\mathbf{x}_j - \mathbf{x}_i) = \sin(\mathbf{x}_j)
     \cos(\mathbf{x}_i) - \cos(\mathbf{x}_j) \sin(\mathbf{x}_i)`, which avoids
-    materializing per-edge messages at every solver stage.
+    materializing per-edge messages at every solver stage and thus reduces
+    memory consumption during training.
+    Note that backpropagating to the values of :class:`torch.sparse` matrices
+    can be slow on CPUs, such that :obj:`edge_index` or
+    :class:`torch_sparse.SparseTensor` inputs may train faster there.
 
     If :obj:`mean_field=True`, the coupling term is replaced by the
     mean-field formulation of the official implementation
@@ -108,6 +114,20 @@ class KuramotoConv(MessagePassing):
     not identical to the equation above. Unlike the equation above, it is not
     differentiable where :math:`\sum_j a_{i,j} e^{\iota \mathbf{x}_j}`
     vanishes.
+
+    .. note::
+
+        The `official implementation
+        <https://github.com/Fsoft-AIC/Reducing-Over-smoothing-via-a-Kuramoto-
+        Model-based-Approach>`_ always uses :obj:`mean_field=True` and
+        :obj:`detach_omega=True`, and clamps :math:`\mathbf{X}(0)` to
+        :math:`[0, \pi]` (see :obj:`clamp` in
+        :class:`~torch_geometric.contrib.nn.models.KuramotoGNN`).
+        The attention normalization and direction are dataset-specific
+        hyperparameters there, *e.g.*, :obj:`normalization="squareplus"` and
+        :obj:`normalize_over="source"` on Cora.
+        It further initializes the query and key weights to :math:`10^{-5}`,
+        such that attention coefficients start out (almost) uniform.
 
     .. note::
 
@@ -130,8 +150,9 @@ class KuramotoConv(MessagePassing):
             The last step is shortened to end exactly at :obj:`time`.
             (default: :obj:`1.0`)
         attention (bool, optional): If set to :obj:`False`, will use edge
-            weights instead of learned attention coefficients.
-            (default: :obj:`True`)
+            weights instead of learned attention coefficients. If set to
+            :obj:`True`, edge weights are not supported and the values of
+            sparse input matrices are ignored. (default: :obj:`True`)
         heads (int, optional): Number of attention heads :math:`H`.
             (default: :obj:`1`)
         attention_channels (int, optional): Size of the query and key
@@ -283,6 +304,11 @@ class KuramotoConv(MessagePassing):
         if is_sparse_tensor:
             row, col, edge_weight = edge_index.coo()
             edge_index = torch.stack([col, row], dim=0)
+        elif is_torch_sparse and edge_index.layout == torch.sparse_coo:
+            # `to_edge_index` marks COO matrices as coalesced in-place, which
+            # does not support backpropagation to their values:
+            coo = edge_index.coalesce()
+            edge_index, edge_weight = coo.indices().flip([0]), coo.values()
         elif is_torch_sparse:
             edge_index, edge_weight = to_edge_index(edge_index)
             edge_index = edge_index.flip([0])
@@ -308,14 +334,19 @@ class KuramotoConv(MessagePassing):
 
         adj: Adj = edge_index
         edge_weight = alpha
+        csr: Optional[Tuple[Tensor, Tensor, Tensor]] = None
         if is_sparse_tensor:
             adj = SparseTensor(row=edge_index[1], col=edge_index[0],
                                value=alpha,
                                sparse_sizes=(num_nodes, num_nodes))
             edge_weight = None
         elif is_torch_sparse:
-            adj = to_torch_csr_tensor(edge_index.flip([0]), alpha,
-                                      size=(num_nodes, num_nodes))
+            # Sort the edges by target node once to obtain the CSR layout of
+            # the transposed adjacency matrix:
+            row, col = edge_index[1], edge_index[0]
+            _, perm = index_sort(row * num_nodes + col,
+                                 max_value=num_nodes * num_nodes)
+            csr = (index2ptr(row[perm], num_nodes), col[perm], alpha[perm])
             edge_weight = None
 
         if self.adjoint:
@@ -327,7 +358,16 @@ class KuramotoConv(MessagePassing):
             omega = omega.view_as(omega)
 
         def vector_field(x: Tensor) -> Tensor:
-            return omega + self.coupling * self._coupling(x, adj, edge_weight)
+            adj_t = adj
+            if csr is not None:
+                # A new sparse matrix is created for every evaluation, since
+                # backpropagating through a single one used at every solver
+                # stage sums up sparse gradients, which PyTorch does not
+                # support on CPUs without MKL (*e.g.*, on Apple silicon):
+                adj_t = torch.sparse_csr_tensor(*csr,
+                                                size=(num_nodes, num_nodes))
+            return omega + self.coupling * self._coupling(
+                x, adj_t, edge_weight)
 
         adjoint_params = tuple(t for t in (alpha, omega) if t.requires_grad)
         return self._integrate(vector_field, x, adjoint_params)

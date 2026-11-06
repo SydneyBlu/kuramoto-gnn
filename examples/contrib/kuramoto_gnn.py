@@ -23,6 +23,8 @@ parser.add_argument('--method', type=str, default='rk4',
 parser.add_argument('--step_size', type=float, default=1.0)
 parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--epochs', type=int, default=200)
+parser.add_argument('--sparse', action='store_true',
+                    help='Use a sparse adjacency matrix to save memory')
 parser.add_argument('--wandb', action='store_true', help='Track experiment')
 args = parser.parse_args()
 
@@ -39,14 +41,15 @@ init_wandb(name=f'KuramotoGNN-{args.dataset}', time=args.time,
 
 path = osp.join(osp.dirname(osp.realpath(__file__)), '..', '..', 'data',
                 'Planetoid')
-# A sparse adjacency matrix lets `KuramotoConv` evaluate the coupling term via
-# a single sparse-dense matrix product per solver stage:
-transform = T.Compose([
-    T.NormalizeFeatures(),
-    T.ToSparseTensor(layout=torch.sparse_csr),
-])
-dataset = Planetoid(path, args.dataset, transform=transform)
+transform = [T.NormalizeFeatures()]
+if args.sparse:
+    # A sparse adjacency matrix lets `KuramotoConv` evaluate the coupling term
+    # via a single sparse-dense matrix product per solver stage, which avoids
+    # storing per-edge messages for backpropagation:
+    transform.append(T.ToSparseTensor(layout=torch.sparse_csr))
+dataset = Planetoid(path, args.dataset, transform=T.Compose(transform))
 data = dataset[0].to(device)
+adj = data.adj_t if args.sparse else data.edge_index
 
 model = KuramotoGNN(
     dataset.num_features,
@@ -66,7 +69,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=5e-4)
 def train():
     model.train()
     optimizer.zero_grad()
-    out = model(data.x, data.adj_t)
+    out = model(data.x, adj)
     loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
     loss.backward()
     optimizer.step()
@@ -76,7 +79,7 @@ def train():
 @torch.no_grad()
 def test():
     model.eval()
-    pred = model(data.x, data.adj_t).argmax(dim=-1)
+    pred = model(data.x, adj).argmax(dim=-1)
 
     accs = []
     for mask in [data.train_mask, data.val_mask, data.test_mask]:

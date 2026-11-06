@@ -4,12 +4,14 @@ import pytest
 import torch
 
 import torch_geometric.typing
+from torch_geometric import EdgeIndex
 from torch_geometric.contrib.nn.conv import KuramotoConv
 from torch_geometric.testing import onlyFullTest, onlyLinux, withPackage
 from torch_geometric.typing import SparseTensor
 from torch_geometric.utils import (
     add_remaining_self_loops,
     to_dense_adj,
+    to_torch_coo_tensor,
     to_torch_csc_tensor,
     to_torch_csr_tensor,
 )
@@ -284,6 +286,75 @@ def test_kuramoto_conv_adjoint_sparse():
     out.sum().backward()
     assert conv.lin_query.weight.grad is not None
     assert conv.lin_query.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize('mean_field', [False, True])
+@pytest.mark.parametrize('normalize_over', ['target', 'source'])
+def test_kuramoto_conv_directed_graph(normalize_over, mean_field):
+    # Node 4 has no incoming edges and node 5 is isolated:
+    x = torch.randn(6, 8)
+    edge_index = torch.tensor([[0, 1, 2, 3, 4, 4], [1, 2, 0, 0, 1, 3]])
+    conv = KuramotoConv(8, time=1.0, method='rk4', step_size=0.25, heads=2,
+                        normalize_over=normalize_over, mean_field=mean_field)
+
+    A = dense_attention(conv, x, edge_index)
+    expected = dense_integrate(
+        lambda h: dense_vector_field(h, x, A, 1.0, mean_field),
+        x,
+        time=1.0,
+        num_steps=4,
+        method='rk4',
+    )
+    assert torch.allclose(conv(x, edge_index), expected, atol=1e-5)
+
+    adj = to_torch_csr_tensor(edge_index.flip([0]), size=(6, 6))
+    assert torch.allclose(conv(x, adj), expected, atol=1e-5)
+    adj = EdgeIndex(edge_index, sparse_size=(6, 6))
+    assert torch.allclose(conv(x, adj), expected, atol=1e-5)
+
+
+@pytest.mark.parametrize('mean_field', [False, True])
+@pytest.mark.parametrize('attention', [True, False])
+def test_kuramoto_conv_sparse_gradients(attention, mean_field):
+    # Gradients agree for all input formats. For `torch.sparse` inputs, this
+    # requires a new sparse matrix per solver stage on PyTorch builds without
+    # MKL (*e.g.*, on Apple silicon), which cannot accumulate the sparse
+    # gradients of a sparse matrix that is used multiple times:
+    x, edge_index = get_graph()
+    conv = KuramotoConv(8, time=1.0, method='rk4', step_size=0.25, heads=2,
+                        attention=attention, mean_field=mean_field)
+
+    layouts = [None, torch.sparse_csr, torch.sparse_coo]
+    if torch_geometric.typing.WITH_TORCH_SPARSE:
+        layouts.append('sparse_tensor')
+
+    grads = []
+    for layout in layouts:
+        x_ = x.clone().requires_grad_()
+        edge_weight = torch.linspace(0.5, 1.5, edge_index.size(1))
+        edge_weight.requires_grad_()
+        value = None if attention else edge_weight
+        index_t = edge_index.flip([0])
+
+        if layout is None:
+            adj, weight = edge_index, value
+        elif layout == 'sparse_tensor':
+            adj = SparseTensor.from_edge_index(index_t, value, (6, 6))
+            weight = None
+        elif layout == torch.sparse_csr:
+            adj, weight = to_torch_csr_tensor(index_t, value, (6, 6)), None
+        else:
+            adj, weight = to_torch_coo_tensor(index_t, value, (6, 6)), None
+        out = conv(x_, adj, weight)
+
+        inputs = [x_] + list(conv.parameters())
+        if not attention:
+            inputs.append(edge_weight)
+        grads.append(torch.autograd.grad(out.sin().sum(), inputs))
+
+    for grad in grads[1:]:
+        for actual, expected in zip(grad, grads[0]):
+            assert torch.allclose(actual, expected, atol=1e-5)
 
 
 @onlyLinux
